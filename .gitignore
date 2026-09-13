@@ -1,0 +1,9 @@
+# 编译产物
+*.exe
+*.pdb
+
+# Visual Studio / IDE
+.vs/
+bin/
+obj/
+*.user
