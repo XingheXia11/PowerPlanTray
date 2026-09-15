@@ -39,6 +39,8 @@
 
 ## ⚡ 一键复刻作者同款三档电源计划（可选）
 
+**双击 `setup_plans.bat`** 即可（或运行下面的命令）：
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File setup_plans.ps1
 ```
