@@ -19,8 +19,8 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("PowerPlanTray")]
 [assembly: AssemblyDescription("系统托盘电源计划快速切换工具")]
 [assembly: AssemblyProduct("PowerPlanTray")]
-[assembly: AssemblyVersion("1.2.1.0")]
-[assembly: AssemblyFileVersion("1.2.1.0")]
+[assembly: AssemblyVersion("1.2.2.0")]
+[assembly: AssemblyFileVersion("1.2.2.0")]
 
 namespace PowerPlanTray
 {
