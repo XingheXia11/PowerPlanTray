@@ -19,8 +19,8 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("PowerPlanTray")]
 [assembly: AssemblyDescription("系统托盘电源计划快速切换工具")]
 [assembly: AssemblyProduct("PowerPlanTray")]
-[assembly: AssemblyVersion("1.5.0.0")]
-[assembly: AssemblyFileVersion("1.5.0.0")]
+[assembly: AssemblyVersion("1.6.0.0")]
+[assembly: AssemblyFileVersion("1.6.0.0")]
 
 namespace PowerPlanTray
 {
@@ -246,9 +246,13 @@ namespace PowerPlanTray
             {
                 Renderer = new ModernMenuRenderer(pal),
                 Font = MenuFont,
-                Padding = new Padding(12),
+                Padding = new Padding(S(12)),
+                ImageScalingSize = new Size(S(16), S(16)),
                 DropShadowEnabled = true
             };
+
+            // 上下灰边距（自身 Padding 被 WinForms 压成 2px，用不可见占位补到 12）
+            strip.Items.Add(new CardGap { AutoSize = false, Height = S(10) });
 
             // 列表卡：三档计划 + 退出，行间发丝分隔线
             foreach (PlanInfo p in plans)
@@ -260,11 +264,12 @@ namespace PowerPlanTray
                     ImageScaling = ToolStripItemImageScaling.None,
                     ForeColor = pal.Text,
                     Padding = ItemPad,
+                    Font = p.IsActive ? MenuFontBold : MenuFont, // 生效档加粗，不必扫到右侧才看出来
                     Checked = p.IsActive // 对勾由渲染器画在右侧
                 };
                 item.Click += delegate { ActivatePlan(guid); };
                 strip.Items.Add(item);
-                strip.Items.Add(new InsetSeparator { AutoSize = false, Height = 6 });
+                strip.Items.Add(new InsetSeparator { AutoSize = false, Height = S(6) });
             }
 
             var exitItem = new ToolStripMenuItem("退出")
@@ -285,7 +290,7 @@ namespace PowerPlanTray
             };
             strip.Items.Add(exitItem);
 
-            strip.Items.Add(new CardGap { AutoSize = false, Height = 14 });
+            strip.Items.Add(new CardGap { AutoSize = false, Height = S(14) });
 
             // 设置卡：功能行
             var autoRun = new ToolStripMenuItem("开机自动启动")
@@ -299,7 +304,7 @@ namespace PowerPlanTray
                 autoRun.Checked = IsAutoRun();
             };
             strip.Items.Add(autoRun);
-            strip.Items.Add(new InsetSeparator { AutoSize = false, Height = 6 });
+            strip.Items.Add(new InsetSeparator { AutoSize = false, Height = S(6) });
 
             var refreshItem = new ToolStripMenuItem("刷新电源计划列表")
             {
@@ -308,7 +313,7 @@ namespace PowerPlanTray
             };
             refreshItem.Click += delegate { lastSignature = ""; };
             strip.Items.Add(refreshItem);
-            strip.Items.Add(new InsetSeparator { AutoSize = false, Height = 6 });
+            strip.Items.Add(new InsetSeparator { AutoSize = false, Height = S(6) });
 
             var openPanel = new ToolStripMenuItem("打开控制面板电源选项")
             {
@@ -317,11 +322,18 @@ namespace PowerPlanTray
             };
             openPanel.Click += delegate { OpenPowerOptions(); };
             strip.Items.Add(openPanel);
+            strip.Items.Add(new CardGap { AutoSize = false, Height = S(10) });
+
+            // 灰边距：条目 Padding 和自身 Padding 都撑不开窗口宽度（WinForms 按文字量宽），
+            // 所以关掉自动宽、直接加两个边距，内容右移由渲染器自绘时统一偏移完成。
+            int wantWidth = strip.PreferredSize.Width + S(CardInset * 2);
+            strip.AutoSize = false;
+            strip.Size = new Size(wantWidth, strip.PreferredSize.Height);
 
             strip.Opened += delegate
             {
                 menuOpen = true;
-                ApplyRoundedRegion(strip, 14); // 区域圆角：比 Dwm 默认 8px 更接近设计稿，投影跟随区域形状
+                ApplyRoundedRegion(strip, S(11)); // 区域圆角无抗锯齿，半径越小阶梯越看不出；14 时四角有明显台阶
             };
             strip.Closed += delegate
             {
@@ -530,10 +542,7 @@ namespace PowerPlanTray
         private static Icon CreateIcon(int rank)
         {
             // 按“托盘真实显示尺寸”出图：超采样绘制后高质量缩到目标尺寸，系统零缩放显示。
-            // 目标尺寸按真实 DPI 计算（16 基准 × 缩放系数），PerMonitorV2 清单生效后 FromHwnd 返回主屏真实 DPI。
-            float dpi;
-            using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) dpi = g.DpiX;
-            int target = (int)Math.Round(16f * dpi / 96f);
+            int target = (int)Math.Round(16f * DeviceDpi / 96f);
             if (target < 16) target = 16;
             if (target > 64) target = 64;
 
@@ -545,16 +554,17 @@ namespace PowerPlanTray
             }
         }
 
-        // 2x 超采样画布绘制（画法使用 64 逻辑坐标），再双三次缩到 size
+        // 2x（小尺寸 4x）超采样画布绘制（画法使用 64 逻辑坐标），再双三次缩到 size
         internal static Bitmap RenderIconBitmap(int rank, int size)
         {
-            int ss = Math.Max(2, size * 2);
+            bool small = size <= 28; // 托盘 16~20px：细节会被插值抹平，改走简化画法
+            int ss = Math.Max(2, size * (small ? 4 : 2));
             using (var design = new Bitmap(ss, ss))
             using (Graphics gd = Graphics.FromImage(design))
             {
                 gd.SmoothingMode = SmoothingMode.AntiAlias;
                 gd.ScaleTransform(ss / 64f, ss / 64f);
-                DrawIconArtwork(gd, rank);
+                DrawIconArtwork(gd, rank, small);
 
                 var bmp = new Bitmap(size, size);
                 using (Graphics g = Graphics.FromImage(bmp))
@@ -569,7 +579,7 @@ namespace PowerPlanTray
             }
         }
 
-        private static void DrawIconArtwork(Graphics gd, int rank)
+        private static void DrawIconArtwork(Graphics gd, int rank, bool small)
         {
             Color top, mid, bottom, inner;
             ThemePalette(rank, out top, out mid, out bottom, out inner);
@@ -584,27 +594,32 @@ namespace PowerPlanTray
                     gradient.InterpolationColors = blend;
                     gd.FillPath(gradient, tile);
                 }
-                // 顶部一层极淡的受光
-                gd.SetClip(tile);
-                using (var sheen = new LinearGradientBrush(new RectangleF(0f, 0f, 64f, 30f),
-                    Color.FromArgb(26, 255, 255, 255), Color.FromArgb(0, 255, 255, 255), 90f))
-                    gd.FillRectangle(sheen, new RectangleF(0f, 0f, 64f, 30f));
-                gd.ResetClip();
+                // 顶部一层极淡的受光；小尺寸上它只会让电池边缘发灰，故省略
+                if (!small)
+                {
+                    gd.SetClip(tile);
+                    using (var sheen = new LinearGradientBrush(new RectangleF(0f, 0f, 64f, 30f),
+                        Color.FromArgb(26, 255, 255, 255), Color.FromArgb(0, 255, 255, 255), 90f))
+                        gd.FillRectangle(sheen, new RectangleF(0f, 0f, 64f, 30f));
+                    gd.ResetClip();
+                }
             }
 
-            // 实心白电池 + 档位色闪电
+            // 实心白电池 + 档位色闪电：小尺寸时主体放大、闪电加粗，否则缩到 20px 直接糊掉
+            RectangleF bodyRect = small ? new RectangleF(11f, 21.5f, 36f, 21f) : new RectangleF(13f, 22.5f, 32f, 19f);
+            RectangleF capRect = small ? new RectangleF(49.5f, 27f, 6f, 11f) : new RectangleF(47.5f, 27.5f, 5f, 9f);
             using (var white = new SolidBrush(Color.White))
             {
-                using (GraphicsPath body = RoundedRect(new RectangleF(13f, 22.5f, 32f, 19f), 5f))
+                using (GraphicsPath body = RoundedRect(bodyRect, small ? 5.5f : 5f))
                     gd.FillPath(white, body);
-                using (GraphicsPath cap = RoundedRect(new RectangleF(47.5f, 27.5f, 5f, 9f), 2.2f))
+                using (GraphicsPath cap = RoundedRect(capRect, small ? 2.4f : 2.2f))
                     gd.FillPath(white, cap);
             }
-            using (GraphicsPath bolt = BoltPath(29f, 32f, 1f))
+            using (GraphicsPath bolt = BoltPath(29f, 32f, small ? 1.15f : 1f))
             {
                 using (var fill = new SolidBrush(inner))
                     gd.FillPath(fill, bolt);
-                using (var rounder = new Pen(inner, 2f) { LineJoin = LineJoin.Round })
+                using (var rounder = new Pen(inner, small ? 3.4f : 2f) { LineJoin = LineJoin.Round })
                     gd.DrawPath(rounder, bolt);
             }
         }
@@ -677,14 +692,39 @@ namespace PowerPlanTray
             return path;
         }
 
-        // ---- iOS 风格菜单：圆角窗口、亮/暗自适应、档位色点、右侧对勾、圆角悬停高亮 ----
+        // ---- iOS 风格菜单：圆角窗口、档位色点、右侧对勾、圆角悬停高亮 ----
+
+        // 度量基准：设计稿在这台 120 DPI（125%）机器上定稿，故以 120 为锚点等比缩放。
+        // 120 DPI 时 S() 恒等（与已验收稿逐像素一致），100%/150% 机器上留白与色点跟着字号一起缩。
+        private static readonly float DeviceDpi = GetDeviceDpi();
+
+        private static float GetDeviceDpi()
+        {
+            using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) return g.DpiX;
+        }
+
+        private static int S(int designPx)
+        {
+            return (int)Math.Round(designPx * DeviceDpi / 120f);
+        }
+
+        private static float S(float designPx)
+        {
+            return designPx * DeviceDpi / 120f;
+        }
 
         private static readonly Font MenuFont = new Font("Microsoft YaHei UI", 9.5F);
+        private static readonly Font MenuFontBold = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold);
         private static readonly Font MenuCheckFont = new Font("Segoe MDL2 Assets", 10F);
-        private static readonly Padding ItemPad = new Padding(4, 5, 0, 5); // 行高 26 -> 36
+        // 条目 Padding 只改条目宽度、自身 Padding 会被 ContextMenuStrip 重算（实测 {35,2,1,2}），
+        // 两者都撑不开窗口宽度；灰边距改由"关自动宽 + 自绘时统一右移"实现，见 BuildMenu 与渲染器。
+        private static Padding ItemPad { get { return new Padding(S(4), S(5), 0, S(5)); } }
+        private static readonly int CardInset = 12; // 卡片与窗口边缘的浅灰间距（设计值）
         private static readonly Color QuitDot = Color.FromArgb(0x8E, 0x8E, 0x93);
         private static readonly Dictionary<string, Bitmap> DotImageCache = new Dictionary<string, Bitmap>();
-        private static readonly Bitmap TransparentDot = new Bitmap(18, 18); // 功能行文字对齐占位
+
+        private static Bitmap transparentDot;
+        private static Bitmap TransparentDot { get { return transparentDot ?? (transparentDot = new Bitmap(S(18), S(18))); } } // 功能行文字对齐占位
 
         // 档位色点（缓存）；选中态由渲染器画右侧对勾，不在图标上体现
         private static Bitmap GetDotImage(Color accent)
@@ -693,12 +733,13 @@ namespace PowerPlanTray
             Bitmap bmp;
             if (!DotImageCache.TryGetValue(key, out bmp))
             {
-                bmp = new Bitmap(18, 18);
+                int box = S(18), pad = S(3), dia = S(12);
+                bmp = new Bitmap(box, box);
                 using (Graphics g = Graphics.FromImage(bmp))
                 {
                     g.SmoothingMode = SmoothingMode.AntiAlias;
                     using (SolidBrush brush = new SolidBrush(accent))
-                        g.FillEllipse(brush, 3f, 3f, 12f, 12f); // 直径12，圆心(9,9)
+                        g.FillEllipse(brush, pad, pad, dia, dia); // 设计稿：直径12，圆心(9,9)
                 }
                 DotImageCache[key] = bmp;
             }
@@ -707,7 +748,7 @@ namespace PowerPlanTray
 
         private sealed class MenuPalette
         {
-            public Color Bg, Card, Text, SubText, Hover, Separator;
+            public Color Bg, Card, Text, SubText, Hover, Separator, AccentCheck, MutedCheck;
         }
 
         // 固定浅色外观（与设计稿一致）：浅灰底 + 白色分组卡片
@@ -718,8 +759,10 @@ namespace PowerPlanTray
             p.Card = Color.White;
             p.Text = C(0x1C, 0x1C, 0x1E);
             p.SubText = C(0x6C, 0x6C, 0x70);
-            p.Hover = Color.FromArgb(10, 0, 0, 0);
+            p.Hover = Color.FromArgb(18, 0, 0, 0); // 浅灰底上 4% 几乎不可见，7% 才像 iOS 的按压块
             p.Separator = C(0xE3, 0xE3, 0xE8);
+            p.AccentCheck = C(0x00, 0x7A, 0xFF); // 当前计划：iOS 蓝
+            p.MutedCheck = QuitDot;             // 开关类状态：次级灰，不与当前档位抢视觉
             return p;
         }
 
@@ -734,6 +777,8 @@ namespace PowerPlanTray
         private sealed class ModernMenuRenderer : ToolStripProfessionalRenderer
         {
             private readonly MenuPalette pal;
+            private int textLeft; // 由文字绘制回调记录，发丝线据此与文字左缘对齐（随字号/DPI 自适应）
+            private int cardLeft, cardRight; // 卡片左右边缘（条带坐标），由背景绘制时记录
 
             public ModernMenuRenderer(MenuPalette palette)
             {
@@ -745,8 +790,10 @@ namespace PowerPlanTray
             {
                 e.Graphics.Clear(pal.Bg);
 
-                // 在条目底下垫分组卡片（列表卡 / 设置卡）
+                // 在条目底下垫分组卡片（列表卡 / 设置卡）；左右按窗口内缩，保证灰边距一定在窗口内
                 e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                cardLeft = S(CardInset);
+                cardRight = e.ToolStrip.ClientSize.Width - S(CardInset);
                 Rectangle? list = null, settings = null;
                 bool afterExit = false;
                 foreach (ToolStripItem item in e.ToolStrip.Items)
@@ -772,7 +819,7 @@ namespace PowerPlanTray
             {
                 if (!bounds.HasValue) return;
                 Rectangle b = bounds.Value;
-                using (GraphicsPath path = RoundedRect(new RectangleF(b.X, b.Top - 2f, b.Width, b.Height + 4f), 12f))
+                using (GraphicsPath path = RoundedRect(new RectangleF(cardLeft, b.Top - S(2f), cardRight - cardLeft, b.Height + S(4f)), S(10f)))
                 using (var brush = new SolidBrush(pal.Card))
                     g.FillPath(brush, path);
             }
@@ -784,21 +831,24 @@ namespace PowerPlanTray
             protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e) { }
 
             // 图像全部由渲染器画：基类会给 Checked 项在图像区画淡蓝色选中底版（与设计不符）
+            // 横向统一右移一个灰边距：窗口被撑宽后内容要落在卡片内
             protected override void OnRenderItemImage(ToolStripItemImageRenderEventArgs e)
             {
                 if (e.Image == null) return;
                 Rectangle r = e.ImageRectangle;
                 e.Graphics.DrawImage(e.Image,
-                    r.X + (r.Width - e.Image.Width) / 2,
+                    r.X + (r.Width - e.Image.Width) / 2 + S(CardInset),
                     r.Y + (r.Height - e.Image.Height) / 2,
                     e.Image.Width, e.Image.Height);
             }
 
             protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
             {
-                // 雅黑行盒含 descent，CJK 字形视觉偏上，下移 4px 补偿使其在行格内 optical 居中
+                if (textLeft == 0 && e.Item is ToolStripMenuItem) textLeft = e.TextRectangle.X;
+                // 雅黑行盒含 descent，CJK 字形视觉偏上，下移补偿到行格内 optical 居中。
+                // 实测（120DPI/9.5pt）：Regular 墨盒 15px 需 +4，Bold 墨盒 16px 且基线上移需 +5 才能上下留白相等。
                 Rectangle tr = e.TextRectangle;
-                tr.Offset(0, 4);
+                tr.Offset(S(CardInset), S(e.Item.Font.Bold ? 5 : 4));
                 TextRenderer.DrawText(e.Graphics, e.Text, e.Item.Font, tr, e.Item.ForeColor,
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
             }
@@ -809,8 +859,9 @@ namespace PowerPlanTray
 
                 if (e.Item.Selected)
                 {
-                    Rectangle rect = new Rectangle(2, 1, e.Item.Width - 4, e.Item.Height - 2);
-                    using (GraphicsPath path = RoundedRect(new RectangleF(rect.X, rect.Y, rect.Width, rect.Height), 8f))
+                    // 悬停胶囊贴在卡片内 4px
+                    Rectangle rect = new Rectangle(cardLeft + S(4), S(1), cardRight - cardLeft - S(8), e.Item.Height - S(2));
+                    using (GraphicsPath path = RoundedRect(new RectangleF(rect.X, rect.Y, rect.Width, rect.Height), S(8f)))
                     using (SolidBrush hover = new SolidBrush(pal.Hover))
                     {
                         e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
@@ -818,20 +869,29 @@ namespace PowerPlanTray
                     }
                 }
 
-                // 选中对勾（Segoe MDL2 图标）画在右侧：当前计划 / 开机自动启动
+                // 选中对勾（Segoe MDL2 图标）画在卡片右侧内缩处：当前计划用强调蓝，开关状态用次级灰
                 ToolStripMenuItem menuItem = e.Item as ToolStripMenuItem;
                 if (menuItem != null && menuItem.Checked)
+                {
+                    Color checkColor = menuItem.Text == "开机自动启动" ? pal.MutedCheck : pal.AccentCheck;
+                    // 不加 y 偏移：MDL2 对勾墨盒本身居中即行格居中，与修正后的文字中线重合
                     TextRenderer.DrawText(e.Graphics, "\uE73E", MenuCheckFont,
-                        new Rectangle(e.Item.Width - 26, 4, 22, e.Item.Height),
-                        pal.Text, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                        new Rectangle(cardRight - S(26), 0, S(22), e.Item.Height),
+                        checkColor, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                }
             }
 
+            // 发丝线与文字左缘对齐：从相邻计划项的实际文字位置取，换字号/DPI 也不会错位
             protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
             {
                 if (e.Item is CardGap) return; // 卡片之间的空隙不画线
                 int y = e.Item.Height / 2;
+                // 分隔线条目原点比计划条目靠右 2px，需换算回同一坐标系；汉字墨盒比文字框左缘再靠右 5px
+                int origin = e.Item.Bounds.X;
+                int left = (textLeft > 0 ? textLeft + S(5) : S(36)) + S(CardInset) - origin;
+                int right = (cardRight > 0 ? cardRight : e.Item.Width - S(CardInset)) - origin - S(12);
                 using (Pen pen = new Pen(pal.Separator))
-                    e.Graphics.DrawLine(pen, 36, y, e.Item.Width - 12, y); // 从文字左缘起笔
+                    e.Graphics.DrawLine(pen, left, y, right, y);
             }
         }
 
