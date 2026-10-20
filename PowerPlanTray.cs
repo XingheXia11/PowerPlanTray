@@ -1,5 +1,5 @@
 // PowerPlanTray —— Windows 系统托盘电源计划快速切换工具
-// 左键点击托盘图标弹出菜单，点击电源计划名即可切换；双击图标直达控制面板电源选项。
+// 右键点击托盘图标弹出快速菜单；双击图标直达 Windows 电源选项。
 // 直接调用 powrprof.dll（PowerEnumerate / PowerGetActiveScheme / PowerSetActiveScheme），
 // 不依赖 powercfg.exe，不会闪黑窗。
 // 编译：双击运行 build.cmd（使用 Windows 自带的 .NET Framework csc.exe）
@@ -19,8 +19,8 @@ using Microsoft.Win32;
 [assembly: AssemblyTitle("PowerPlanTray")]
 [assembly: AssemblyDescription("系统托盘电源计划快速切换工具")]
 [assembly: AssemblyProduct("PowerPlanTray")]
-[assembly: AssemblyVersion("1.6.0.0")]
-[assembly: AssemblyFileVersion("1.6.0.0")]
+[assembly: AssemblyVersion("1.8.7.0")]
+[assembly: AssemblyFileVersion("1.8.7.0")]
 
 namespace PowerPlanTray
 {
@@ -62,13 +62,13 @@ namespace PowerPlanTray
         public bool IsActive;
     }
 
-    // 计划项的选中态用 Checked 表示，对勾由 ModernMenuRenderer 统一画在右侧（iOS 风格）
+    // 托盘菜单根据系统实际活动的电源计划绘制选中状态。
 
     // 可选配置文件 PowerPlanTray.ini（与本 exe 同目录），不存在时用内置默认值
     internal sealed class ToolConfig
     {
-        public string[] WeakWords = new string[] { "电影", "办公", "节能", "省电", "低热", "低耗", "低功耗" };   // 蓝色/最弱档
-        public string[] MidWords = new string[] { "AI", "平衡" };                                              // 绿色/中间档
+        public string[] WeakWords = new string[] { "电影", "办公", "节能", "省电", "低热", "低耗", "低功耗" };   // 绿色/最弱档
+        public string[] MidWords = new string[] { "AI", "平衡" };                                              // 蓝色/中间档
         public string[] StrongWords = new string[] { "游戏", "卓越", "高性能", "极致" };                        // 红色/最强档
         public int RefreshMs = 3000;
 
@@ -77,7 +77,8 @@ namespace PowerPlanTray
             ToolConfig cfg = new ToolConfig();
             try
             {
-                string path = Path.ChangeExtension(Application.ExecutablePath, ".ini");
+                // 固定配置文件名：发布 exe 可能带版本号，配置不随 exe 名变化
+                string path = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "PowerPlanTray.ini");
                 if (!File.Exists(path)) return cfg;
 
                 foreach (string raw in File.ReadAllLines(path))
@@ -113,16 +114,19 @@ namespace PowerPlanTray
         private const string AppKeyPath = @"Software\PowerPlanTray";
         private const string WelcomeValueName = "WelcomeShown";
         private const uint AccessScheme = 16; // powrprof.h: ACCESS_SCHEME
+        private const uint ERROR_NO_MORE_ITEMS = 259; // PowerEnumerate 正常枚举结束
 
         private readonly OwnerForm ownerForm;
         private readonly IntPtr ownerHandle;
         private readonly NotifyIcon tray;
         private readonly Timer refreshTimer;
-        private ContextMenuStrip menu;
+        private TrayPopupForm popupForm;
         private Icon currentIcon;
         private readonly ToolConfig cfg = ToolConfig.Load();
         private string lastSignature = "";
         private bool menuOpen;
+        private uint lastPlanError;      // 最近一次 GetPlans 遇到的真实 API 错误码（0 = 无）
+        private uint reportedPlanError;  // 已提示过的错误码，避免重复弹窗
 
         [DllImport("powrprof.dll")]
         private static extern uint PowerEnumerate(IntPtr RootPowerKey, IntPtr SchemeGuid, IntPtr SubGroupOfPowerSettingsGuid, uint AccessFlags, uint Index, byte[] Buffer, ref uint BufferSize);
@@ -133,23 +137,14 @@ namespace PowerPlanTray
         [DllImport("powrprof.dll")]
         private static extern uint PowerSetActiveScheme(IntPtr UserRootPowerKey, ref Guid SchemeGuid);
 
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr LocalFree(IntPtr hMem);
+
         [DllImport("powrprof.dll")]
         private static extern uint PowerReadFriendlyName(IntPtr RootPowerKey, ref Guid SchemeGuid, IntPtr SubGroupOfPowerSettings, IntPtr PowerSettingGuid, byte[] Buffer, ref uint BufferSize);
 
         [DllImport("user32.dll")]
         private static extern bool DestroyIcon(IntPtr hIcon);
-
-        // 把冷内存页还给系统，让任务管理器里的占用长期保持在个位数 MB
-        [DllImport("kernel32.dll")]
-        private static extern IntPtr GetCurrentProcess();
-
-        [DllImport("kernel32.dll")]
-        private static extern bool SetProcessWorkingSetSize(IntPtr hProcess, IntPtr min, IntPtr max);
-
-        private static void TrimMemory()
-        {
-            SetProcessWorkingSetSize(GetCurrentProcess(), new IntPtr(-1), new IntPtr(-1));
-        }
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern uint RegisterWindowMessage(string message);
@@ -157,34 +152,37 @@ namespace PowerPlanTray
         [DllImport("user32.dll")]
         private static extern bool SetForegroundWindow(IntPtr hWnd);
 
+        [DllImport("user32.dll")]
+        private static extern IntPtr WindowFromPoint(Point p);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetParent(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
         public TrayContext()
         {
-            // 隐藏窗体：用于接收 TaskbarCreated 广播（资源管理器重启后自动补回图标），
-            // 也作为菜单的前台窗口，保证菜单点击别处时能正常收起。
+            // 隐藏窗体：接收 TaskbarCreated 广播，资源管理器重启后自动补回托盘图标。
             ownerForm = new OwnerForm(OnTaskbarCreated);
             ownerHandle = ownerForm.Handle;
 
             List<PlanInfo> plans = GetPlans();
             lastSignature = Signature(plans);
-            menu = BuildMenu(plans);
-
+            // 不使用系统默认 ContextMenuStrip；使用自绘悬浮菜单。
             tray = new NotifyIcon
             {
                 Text = GetTooltipText(plans),
-                ContextMenuStrip = menu,
                 Visible = true
             };
             ApplyIconForActive(plans);
             tray.MouseClick += OnTrayClick;
             tray.MouseDoubleClick += OnTrayDoubleClick;
+            ReportPlanError();
 
             // 定期检查电源计划是否有外部变化（比如在控制面板里改了）
             refreshTimer = new Timer { Interval = cfg.RefreshMs };
-            refreshTimer.Tick += delegate
-            {
-                RefreshIfChanged();
-                TrimMemory(); // 周期性修剪，常驻内存保持在个位数 MB
-            };
+            refreshTimer.Tick += delegate { RefreshIfChanged(); };
             refreshTimer.Start();
 
             FixAutoRunPath();
@@ -193,7 +191,7 @@ namespace PowerPlanTray
             if (ShouldShowWelcome())
             {
                 tray.BalloonTipTitle = "PowerPlanTray 已在托盘运行";
-                tray.BalloonTipText = "左键点击托盘图标即可快速切换电源计划。";
+                tray.BalloonTipText = "右键点击托盘图标打开快速菜单；双击打开 Windows 电源选项。";
                 tray.ShowBalloonTip(3000);
             }
         }
@@ -205,16 +203,119 @@ namespace PowerPlanTray
 
         private void OnTrayClick(object sender, MouseEventArgs e)
         {
-            if (e.Button != MouseButtons.Left) return;
-            SetForegroundWindow(ownerHandle);
-            menu.Show(ownerForm, Cursor.Position);
+            if (e.Button != MouseButtons.Right) return; // 仅右键唤出面板
+            TogglePopupMenu();
         }
 
-        // 双击直达电源选项；先收起第一次单击弹出的菜单
+        // 只显示托盘悬浮菜单，不显示独立主窗口。
+        private void TogglePopupMenu()
+        {
+            try
+            {
+                if (popupForm != null && !popupForm.IsDisposed && popupForm.Visible)
+                {
+                    HidePopup();
+                    return;
+                }
+
+                List<PlanInfo> plans = GetPlans();
+                if (popupForm == null || popupForm.IsDisposed)
+                {
+                    popupForm = new TrayPopupForm(this, plans, SafeIsAutoRun());
+                    popupForm.Deactivate += delegate
+                    {
+                        if (popupForm == null || popupForm.IsDisposed || !popupForm.Visible) return;
+                        // 点击任务栏/托盘引起的失焦不自动收起，交给托盘右键显式切换
+                        if (CursorOverTaskbar()) return;
+                        HidePopup();
+                    };
+                }
+                else
+                {
+                    popupForm.RefreshData(plans, SafeIsAutoRun());
+                }
+
+                PositionPopup(popupForm);
+                menuOpen = true;
+                popupForm.Show(ownerForm);
+                popupForm.Activate();
+                SetForegroundWindow(popupForm.Handle);
+            }
+            catch (Exception ex)
+            {
+                tray.BalloonTipTitle = "无法打开快速菜单";
+                tray.BalloonTipText = ex.Message;
+                tray.ShowBalloonTip(2500);
+            }
+        }
+
+        private static void PositionPopup(Form form)
+        {
+            Rectangle area = Screen.FromPoint(Cursor.Position).WorkingArea;
+            int x = Cursor.Position.X - form.Width + S(18);
+            int y = Cursor.Position.Y - form.Height - S(8);
+            if (y < area.Top) y = Cursor.Position.Y + S(8);
+            if (x < area.Left) x = area.Left;
+            if (x + form.Width > area.Right) x = area.Right - form.Width;
+            if (y < area.Top) y = area.Top;
+            if (y + form.Height > area.Bottom) y = area.Bottom - form.Height;
+            form.Location = new Point(x, y);
+        }
+
+        private void HidePopup()
+        {
+            if (popupForm != null && !popupForm.IsDisposed) popupForm.Hide();
+            menuOpen = false;
+        }
+
+        // 桌面工作区之外即任务栏，托盘溢出面板单独按窗口类名识别
+        private static bool CursorOverTaskbar()
+        {
+            try
+            {
+                Point p = Cursor.Position;
+                if (!Screen.FromPoint(p).WorkingArea.Contains(p)) return true;
+
+                IntPtr h = WindowFromPoint(p);
+                for (int i = 0; i < 8 && h != IntPtr.Zero; i++)
+                {
+                    StringBuilder sb = new StringBuilder(128);
+                    if (GetClassName(h, sb, sb.Capacity) > 0)
+                    {
+                        string cls = sb.ToString();
+                        if (cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd" ||
+                            cls.IndexOf("Overflow", StringComparison.OrdinalIgnoreCase) >= 0)
+                            return true;
+                    }
+                    h = GetParent(h);
+                }
+                return false;
+            }
+            catch { return false; }
+        }
+
+        private void ClosePopupMenu()
+        {
+            menuOpen = false;
+            TrayPopupForm old = popupForm;
+            popupForm = null;
+            if (old != null && !old.IsDisposed)
+            {
+                try { old.Hide(); old.Dispose(); } catch { }
+            }
+        }
+
+        private static bool SafeIsAutoRun()
+        {
+            try { return IsAutoRun(); }
+            catch { return false; }
+        }
+
+        // 双击直达 Windows 电源选项；先收起托盘悬浮菜单
         private void OnTrayDoubleClick(object sender, MouseEventArgs e)
         {
             if (e.Button != MouseButtons.Left) return;
-            if (menu != null && menu.Visible) menu.Close();
+            ClosePopupMenu();
             OpenPowerOptions();
         }
 
@@ -239,120 +340,6 @@ namespace PowerPlanTray
             catch { return false; }
         }
 
-        private ContextMenuStrip BuildMenu(List<PlanInfo> plans)
-        {
-            MenuPalette pal = GetMenuPalette();
-            var strip = new ContextMenuStrip
-            {
-                Renderer = new ModernMenuRenderer(pal),
-                Font = MenuFont,
-                Padding = new Padding(S(12)),
-                ImageScalingSize = new Size(S(16), S(16)),
-                DropShadowEnabled = true
-            };
-
-            // 上下灰边距（自身 Padding 被 WinForms 压成 2px，用不可见占位补到 12）
-            strip.Items.Add(new CardGap { AutoSize = false, Height = S(10) });
-
-            // 列表卡：三档计划 + 退出，行间发丝分隔线
-            foreach (PlanInfo p in plans)
-            {
-                Guid guid = p.Guid; // 闭包必须用循环内的局部副本
-                var item = new ToolStripMenuItem(p.Name)
-                {
-                    Image = GetDotImage(ThemeAccent(PlanRank(p.Name))),
-                    ImageScaling = ToolStripItemImageScaling.None,
-                    ForeColor = pal.Text,
-                    Padding = ItemPad,
-                    Font = p.IsActive ? MenuFontBold : MenuFont, // 生效档加粗，不必扫到右侧才看出来
-                    Checked = p.IsActive // 对勾由渲染器画在右侧
-                };
-                item.Click += delegate { ActivatePlan(guid); };
-                strip.Items.Add(item);
-                strip.Items.Add(new InsetSeparator { AutoSize = false, Height = S(6) });
-            }
-
-            var exitItem = new ToolStripMenuItem("退出")
-            {
-                Image = GetDotImage(QuitDot),
-                ImageScaling = ToolStripItemImageScaling.None,
-                ForeColor = pal.Text,
-                Padding = ItemPad
-            };
-            exitItem.Click += delegate
-            {
-                refreshTimer.Stop();
-                tray.Visible = false;
-                tray.Dispose();
-                if (currentIcon != null) currentIcon.Dispose();
-                ownerForm.Close();
-                Application.Exit();
-            };
-            strip.Items.Add(exitItem);
-
-            strip.Items.Add(new CardGap { AutoSize = false, Height = S(14) });
-
-            // 设置卡：功能行
-            var autoRun = new ToolStripMenuItem("开机自动启动")
-            {
-                Checked = IsAutoRun(), ForeColor = pal.Text, Padding = ItemPad,
-                Image = TransparentDot, ImageScaling = ToolStripItemImageScaling.None
-            };
-            autoRun.Click += delegate
-            {
-                SetAutoRun(!IsAutoRun());
-                autoRun.Checked = IsAutoRun();
-            };
-            strip.Items.Add(autoRun);
-            strip.Items.Add(new InsetSeparator { AutoSize = false, Height = S(6) });
-
-            var refreshItem = new ToolStripMenuItem("刷新电源计划列表")
-            {
-                ForeColor = pal.Text, Padding = ItemPad,
-                Image = TransparentDot, ImageScaling = ToolStripItemImageScaling.None
-            };
-            refreshItem.Click += delegate { lastSignature = ""; };
-            strip.Items.Add(refreshItem);
-            strip.Items.Add(new InsetSeparator { AutoSize = false, Height = S(6) });
-
-            var openPanel = new ToolStripMenuItem("打开控制面板电源选项")
-            {
-                ForeColor = pal.Text, Padding = ItemPad,
-                Image = TransparentDot, ImageScaling = ToolStripItemImageScaling.None
-            };
-            openPanel.Click += delegate { OpenPowerOptions(); };
-            strip.Items.Add(openPanel);
-            strip.Items.Add(new CardGap { AutoSize = false, Height = S(10) });
-
-            // 灰边距：条目 Padding 和自身 Padding 都撑不开窗口宽度（WinForms 按文字量宽），
-            // 所以关掉自动宽、直接加两个边距，内容右移由渲染器自绘时统一偏移完成。
-            int wantWidth = strip.PreferredSize.Width + S(CardInset * 2);
-            strip.AutoSize = false;
-            strip.Size = new Size(wantWidth, strip.PreferredSize.Height);
-
-            strip.Opened += delegate
-            {
-                menuOpen = true;
-                ApplyRoundedRegion(strip, S(11)); // 区域圆角无抗锯齿，半径越小阶梯越看不出；14 时四角有明显台阶
-            };
-            strip.Closed += delegate
-            {
-                menuOpen = false;
-                strip.Region = null;
-                // 菜单关闭后重建（更新勾选状态），BeginInvoke 避免在自己的事件里销毁自己
-                ownerForm.BeginInvoke(new Action(ForceRefresh));
-            };
-            return strip;
-        }
-
-        private void SwapMenu(ContextMenuStrip newMenu)
-        {
-            ContextMenuStrip old = menu;
-            menu = newMenu;
-            tray.ContextMenuStrip = newMenu;
-            if (old != null) old.Dispose();
-        }
-
         private void ActivatePlan(Guid guid)
         {
             Guid g = guid;
@@ -365,16 +352,32 @@ namespace PowerPlanTray
                 return;
             }
             List<PlanInfo> plans = GetPlans();
+            ReportPlanError();
             lastSignature = Signature(plans);
             ApplyIconForActive(plans);
             tray.Text = GetTooltipText(plans);
-            // 菜单勾选会在菜单 Closed -> ForceRefresh 里统一重建
+            if (popupForm != null && !popupForm.IsDisposed)
+                popupForm.RefreshData(plans, SafeIsAutoRun());
         }
 
         private void ForceRefresh()
         {
-            lastSignature = "";
-            RefreshIfChanged();
+            try
+            {
+                List<PlanInfo> plans = GetPlans();
+                ReportPlanError();
+                lastSignature = Signature(plans);
+                ApplyIconForActive(plans);
+                tray.Text = GetTooltipText(plans);
+                if (popupForm != null && !popupForm.IsDisposed)
+                    popupForm.RefreshData(plans, SafeIsAutoRun());
+            }
+            catch (Exception ex)
+            {
+                tray.BalloonTipTitle = "刷新失败";
+                tray.BalloonTipText = ex.Message;
+                tray.ShowBalloonTip(2000);
+            }
         }
 
         private void RefreshIfChanged()
@@ -383,14 +386,40 @@ namespace PowerPlanTray
             {
                 if (menuOpen) return;
                 List<PlanInfo> plans = GetPlans();
+                ReportPlanError();
                 string sig = Signature(plans);
                 if (sig == lastSignature) return;
                 lastSignature = sig;
-                SwapMenu(BuildMenu(plans));
                 ApplyIconForActive(plans);
                 tray.Text = GetTooltipText(plans);
+                if (popupForm != null && !popupForm.IsDisposed)
+                    popupForm.RefreshData(plans, SafeIsAutoRun());
             }
             catch { }
+        }
+
+        // 电源 API 真正报错时给出一次适度提示（同一错误码只弹一次）
+        private void ReportPlanError()
+        {
+            if (lastPlanError == 0 || lastPlanError == reportedPlanError) return;
+            reportedPlanError = lastPlanError;
+            try
+            {
+                tray.BalloonTipTitle = "读取电源计划出错";
+                tray.BalloonTipText = "PowerEnumerate 返回错误码 " + lastPlanError + "，计划列表可能不完整。";
+                tray.ShowBalloonTip(3000);
+            }
+            catch { }
+        }
+
+        private void ExitApp()
+        {
+            try { refreshTimer.Stop(); } catch { }
+            try { ClosePopupMenu(); } catch { }
+            try { tray.Visible = false; tray.Dispose(); } catch { }
+            if (currentIcon != null) { currentIcon.Dispose(); currentIcon = null; }
+            try { ownerForm.Close(); } catch { }
+            Application.Exit();
         }
 
         private static string Signature(List<PlanInfo> plans)
@@ -413,13 +442,21 @@ namespace PowerPlanTray
 
         private List<PlanInfo> GetPlans()
         {
+            lastPlanError = 0;
             var plans = new List<PlanInfo>();
             for (uint index = 0; ; index++)
             {
                 uint size = 16;
                 byte[] buf = new byte[16];
                 uint err = PowerEnumerate(IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, AccessScheme, index, buf, ref size);
-                if (err != 0) break; // ERROR_NO_MORE_ITEMS(259) 或其他错误即结束
+                if (err == ERROR_NO_MORE_ITEMS) break; // 正常枚举结束
+                if (err != 0)
+                {
+                    // 真正的 API 错误：记录，不假装列表已完整
+                    lastPlanError = err;
+                    break;
+                }
+                if (size < 16) break; // 返回数据不足以容纳一个 GUID
                 var guid = new Guid(buf);
                 plans.Add(new PlanInfo { Guid = guid, Name = GetFriendlyName(guid) });
             }
@@ -427,9 +464,12 @@ namespace PowerPlanTray
             IntPtr activePtr;
             if (PowerGetActiveScheme(IntPtr.Zero, out activePtr) == 0 && activePtr != IntPtr.Zero)
             {
-                Guid active = (Guid)Marshal.PtrToStructure(activePtr, typeof(Guid));
-                Marshal.FreeHGlobal(activePtr);
-                foreach (PlanInfo p in plans) p.IsActive = (p.Guid == active);
+                try
+                {
+                    Guid active = (Guid)Marshal.PtrToStructure(activePtr, typeof(Guid));
+                    foreach (PlanInfo p in plans) p.IsActive = (p.Guid == active);
+                }
+                finally { LocalFree(activePtr); } // 按 API 契约用 LocalFree 释放，异常路径同样安全
             }
 
             // 排序：性能从弱到强 —— 弱档 → 中间档 → 强档（关键词组可在 ini 里配置）；同级按名称
@@ -478,32 +518,46 @@ namespace PowerPlanTray
 
         private static bool IsAutoRun()
         {
-            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKeyPath, false))
+            try
             {
-                return key != null && key.GetValue(RunValueName) != null;
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKeyPath, false))
+                {
+                    return key != null && key.GetValue(RunValueName) != null;
+                }
             }
+            catch { return false; }
         }
 
-        private static void SetAutoRun(bool enable)
+        // 返回是否写入成功；失败由调用方提示，不影响程序继续运行
+        private static bool SetAutoRun(bool enable)
         {
-            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKeyPath, true))
+            try
             {
-                if (key == null) return;
-                if (enable) key.SetValue(RunValueName, "\"" + Application.ExecutablePath + "\"");
-                else key.DeleteValue(RunValueName, false);
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKeyPath, true))
+                {
+                    if (key == null) return false;
+                    if (enable) key.SetValue(RunValueName, "\"" + Application.ExecutablePath + "\"");
+                    else key.DeleteValue(RunValueName, false);
+                }
+                return true;
             }
+            catch { return false; }
         }
 
-        // exe 被移动后自动修正自启动注册表里的路径
+        // exe 被移动后自动修正自启动注册表里的路径；失败仅局部处理
         private static void FixAutoRunPath()
         {
-            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKeyPath, true))
+            try
             {
-                if (key == null) return;
-                string value = key.GetValue(RunValueName) as string;
-                string expected = "\"" + Application.ExecutablePath + "\"";
-                if (value != null && value != expected) key.SetValue(RunValueName, expected);
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKeyPath, true))
+                {
+                    if (key == null) return;
+                    string value = key.GetValue(RunValueName) as string;
+                    string expected = "\"" + Application.ExecutablePath + "\"";
+                    if (value != null && value != expected) key.SetValue(RunValueName, expected);
+                }
             }
+            catch { }
         }
 
         // ---- 图标：渐变圆角方块 + 白色电池（内含闪电），颜色随档位变化 ----
@@ -530,13 +584,6 @@ namespace PowerPlanTray
             if (rank == 0)      { top = C(0x6E, 0xE9, 0x97); mid = C(0x34, 0xC7, 0x59); bottom = C(0x1F, 0xA8, 0x45); inner = C(0x1B, 0x9A, 0x3E); }
             else if (rank == 2) { top = C(0xFF, 0x8A, 0x78); mid = C(0xFF, 0x3B, 0x30); bottom = C(0xDE, 0x2C, 0x22); inner = C(0xC8, 0x28, 0x1F); }
             else                { top = C(0x64, 0xB5, 0xFF); mid = C(0x0A, 0x84, 0xFF); bottom = C(0x00, 0x63, 0xD6); inner = C(0x00, 0x59, 0xC2); }
-        }
-
-        private static Color ThemeAccent(int rank)
-        {
-            Color top, mid, bottom, inner;
-            ThemePalette(rank, out top, out mid, out bottom, out inner);
-            return mid;
         }
 
         private static Icon CreateIcon(int rank)
@@ -692,7 +739,7 @@ namespace PowerPlanTray
             return path;
         }
 
-        // ---- iOS 风格菜单：圆角窗口、档位色点、右侧对勾、圆角悬停高亮 ----
+        // ---- 托盘弹出菜单的圆角与 DPI 度量 ----
 
         // 度量基准：设计稿在这台 120 DPI（125%）机器上定稿，故以 120 为锚点等比缩放。
         // 120 DPI 时 S() 恒等（与已验收稿逐像素一致），100%/150% 机器上留白与色点跟着字号一起缩。
@@ -713,191 +760,384 @@ namespace PowerPlanTray
             return designPx * DeviceDpi / 120f;
         }
 
-        private static readonly Font MenuFont = new Font("Microsoft YaHei UI", 9.5F);
-        private static readonly Font MenuFontBold = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold);
-        private static readonly Font MenuCheckFont = new Font("Segoe MDL2 Assets", 10F);
-        // 条目 Padding 只改条目宽度、自身 Padding 会被 ContextMenuStrip 重算（实测 {35,2,1,2}），
-        // 两者都撑不开窗口宽度；灰边距改由"关自动宽 + 自绘时统一右移"实现，见 BuildMenu 与渲染器。
-        private static Padding ItemPad { get { return new Padding(S(4), S(5), 0, S(5)); } }
-        private static readonly int CardInset = 12; // 卡片与窗口边缘的浅灰间距（设计值）
-        private static readonly Color QuitDot = Color.FromArgb(0x8E, 0x8E, 0x93);
-        private static readonly Dictionary<string, Bitmap> DotImageCache = new Dictionary<string, Bitmap>();
-
-        private static Bitmap transparentDot;
-        private static Bitmap TransparentDot { get { return transparentDot ?? (transparentDot = new Bitmap(S(18), S(18))); } } // 功能行文字对齐占位
-
-        // 档位色点（缓存）；选中态由渲染器画右侧对勾，不在图标上体现
-        private static Bitmap GetDotImage(Color accent)
+        // ---- Apple-inspired 托盘悬浮菜单：仅作为快速菜单，不提供独立主窗口 ----
+        private sealed class TrayPopupForm : Form
         {
-            string key = accent.ToArgb().ToString();
-            Bitmap bmp;
-            if (!DotImageCache.TryGetValue(key, out bmp))
+            private readonly TrayContext owner;
+            private List<PlanInfo> plans;
+            private bool autoRun;
+            private const int DesignWidth = 344;
+            private static readonly Color Bg = Color.FromArgb(239, 241, 246);
+            private static readonly Color Card = Color.White;
+            private static readonly Color TextMain = Color.FromArgb(31, 41, 55);
+            private static readonly Color TextSub = Color.FromArgb(112, 124, 142);
+            private static readonly Color Line = Color.FromArgb(226, 230, 237);
+            private static readonly Font FontTitle = new Font("Microsoft YaHei UI", 10.2f, FontStyle.Bold);
+            private static readonly Font FontLabel = new Font("Microsoft YaHei UI", 9.2f, FontStyle.Regular);
+            private static readonly Font FontSub = new Font("Microsoft YaHei UI", 8.1f, FontStyle.Regular);
+            private static readonly Font FontGlyph = new Font("Segoe MDL2 Assets", 12.0f, FontStyle.Regular);
+            private static readonly Font FontHeaderGlyph = new Font("Segoe MDL2 Assets", 17.0f, FontStyle.Regular);
+
+            public TrayPopupForm(TrayContext owner, List<PlanInfo> plans, bool autoRun)
             {
-                int box = S(18), pad = S(3), dia = S(12);
-                bmp = new Bitmap(box, box);
-                using (Graphics g = Graphics.FromImage(bmp))
+                this.owner = owner;
+                this.plans = plans ?? new List<PlanInfo>();
+                this.autoRun = autoRun;
+                FormBorderStyle = FormBorderStyle.None;
+                ShowInTaskbar = false;
+                StartPosition = FormStartPosition.Manual;
+                TopMost = true;
+                BackColor = Bg;
+                Padding = Padding.Empty;
+                DoubleBuffered = true;
+                BuildMainView();
+            }
+
+            protected override CreateParams CreateParams
+            {
+                get
                 {
-                    g.SmoothingMode = SmoothingMode.AntiAlias;
-                    using (SolidBrush brush = new SolidBrush(accent))
-                        g.FillEllipse(brush, pad, pad, dia, dia); // 设计稿：直径12，圆心(9,9)
+                    CreateParams cp = base.CreateParams;
+                    cp.ClassStyle |= 0x00020000; // CS_DROPSHADOW
+                    cp.ExStyle |= 0x00000080;    // WS_EX_TOOLWINDOW
+                    return cp;
                 }
-                DotImageCache[key] = bmp;
-            }
-            return bmp;
-        }
-
-        private sealed class MenuPalette
-        {
-            public Color Bg, Card, Text, SubText, Hover, Separator, AccentCheck, MutedCheck;
-        }
-
-        // 固定浅色外观（与设计稿一致）：浅灰底 + 白色分组卡片
-        private static MenuPalette GetMenuPalette()
-        {
-            MenuPalette p = new MenuPalette();
-            p.Bg = C(0xEC, 0xEC, 0xF1);
-            p.Card = Color.White;
-            p.Text = C(0x1C, 0x1C, 0x1E);
-            p.SubText = C(0x6C, 0x6C, 0x70);
-            p.Hover = Color.FromArgb(18, 0, 0, 0); // 浅灰底上 4% 几乎不可见，7% 才像 iOS 的按压块
-            p.Separator = C(0xE3, 0xE3, 0xE8);
-            p.AccentCheck = C(0x00, 0x7A, 0xFF); // 当前计划：iOS 蓝
-            p.MutedCheck = QuitDot;             // 开关类状态：次级灰，不与当前档位抢视觉
-            return p;
-        }
-
-        private static void ApplyRoundedRegion(ToolStripDropDown strip, int radius)
-        {
-            using (GraphicsPath path = RoundedRect(new RectangleF(0f, 0f, strip.Width, strip.Height), radius))
-            {
-                strip.Region = new Region(path);
-            }
-        }
-
-        private sealed class ModernMenuRenderer : ToolStripProfessionalRenderer
-        {
-            private readonly MenuPalette pal;
-            private int textLeft; // 由文字绘制回调记录，发丝线据此与文字左缘对齐（随字号/DPI 自适应）
-            private int cardLeft, cardRight; // 卡片左右边缘（条带坐标），由背景绘制时记录
-
-            public ModernMenuRenderer(MenuPalette palette)
-            {
-                pal = palette;
-                RoundedEdges = false;
             }
 
-            protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
+            public void RefreshData(List<PlanInfo> newPlans, bool currentAutoRun)
             {
-                e.Graphics.Clear(pal.Bg);
+                plans = newPlans ?? new List<PlanInfo>();
+                autoRun = currentAutoRun;
+                BuildMainView();
+            }
 
-                // 在条目底下垫分组卡片（列表卡 / 设置卡）；左右按窗口内缩，保证灰边距一定在窗口内
+            private void BuildMainView()
+            {
+                ClearControls();
+                int w = TrayContext.S(DesignWidth), x = TrayContext.S(12), innerW = TrayContext.S(320);
+                int y = TrayContext.S(12);
+                PopupHeader header = new PopupHeader(GetActiveModeText(), GetActiveRank());
+                header.SetBounds(x, y, innerW, TrayContext.S(60));
+                Controls.Add(header);
+                y += TrayContext.S(68);
+
+                int rowH = TrayContext.S(56);
+                int listH = Math.Max(rowH, plans.Count * rowH);
+                Panel group = new Panel { BackColor = Card, Bounds = new Rectangle(x, y, innerW, listH) };
+                group.Region = new Region(TrayContext.RoundedRect(new RectangleF(0, 0, group.Width, group.Height), TrayContext.S(13)));
+                Controls.Add(group);
+                for (int i = 0; i < plans.Count; i++)
+                {
+                    PlanInfo plan = plans[i];
+                    PopupModeRow row = new PopupModeRow(owner, plan, owner.PlanRank(plan.Name), plan.IsActive);
+                    row.SetBounds(TrayContext.S(4), i * rowH, innerW - TrayContext.S(8), rowH);
+                    row.Click += delegate
+                    {
+                        Guid guid = plan.Guid;
+                        owner.ClosePopupMenu();
+                        owner.ActivatePlan(guid);
+                    };
+                    group.Controls.Add(row);
+                }
+                y += listH + TrayContext.S(8);
+
+                AutoStartRow autoRow = new AutoStartRow(autoRun);
+                autoRow.SetBounds(x, y, innerW, TrayContext.S(36));
+                autoRow.Click += delegate
+                {
+                    bool want = !TrayContext.IsAutoRun();
+                    bool ok = TrayContext.SetAutoRun(want);
+                    autoRun = TrayContext.SafeIsAutoRun();
+                    if (!ok || autoRun != want)
+                    {
+                        try
+                        {
+                            owner.tray.BalloonTipTitle = "设置失败";
+                            owner.tray.BalloonTipText = want
+                                ? "无法启用开机自动启动（注册表写入失败）。"
+                                : "无法取消开机自动启动（注册表写入失败）。";
+                            owner.tray.ShowBalloonTip(2000);
+                        }
+                        catch { }
+                    }
+                    BuildMainView();
+                };
+                Controls.Add(autoRow);
+                y += TrayContext.S(36);
+
+                AddActionRow(x, ref y, innerW, "刷新电源计划列表", RowGlyph.Refresh, delegate { owner.ForceRefresh(); });
+
+                AddDivider(x + TrayContext.S(12), y + TrayContext.S(2), innerW - TrayContext.S(24));
+                y += TrayContext.S(9);
+                AddActionRow(x, ref y, innerW, "电源计划详情", RowGlyph.Chart, delegate
+                {
+                    owner.ClosePopupMenu();
+                    TrayContext.OpenPowerOptions();
+                });
+                AddActionRow(x, ref y, innerW, "退出", RowGlyph.Power, delegate { owner.ExitApp(); });
+                y += TrayContext.S(8);
+                ClientSize = new Size(w, y);
+                ApplyPopupRegion();
+            }
+
+            private string GetActiveModeText()
+            {
+                foreach (PlanInfo p in plans)
+                    if (p.IsActive) return "当前：" + p.Name;
+                return "当前：未知模式";
+            }
+
+            private int GetActiveRank()
+            {
+                foreach (PlanInfo p in plans)
+                    if (p.IsActive) return owner.PlanRank(p.Name);
+                return 1;
+            }
+
+            private enum RowGlyph { Power, Refresh, Chart }
+
+            // 三个动作行共用同一 16×16 设计网格与线宽，保证图标视觉尺寸一致
+            private static void DrawRowGlyph(Graphics g, Rectangle slot, RowGlyph kind, Color color)
+            {
+                float left = slot.X + (slot.Width - TrayContext.S(16f)) / 2f;
+                float top = slot.Y + (slot.Height - TrayContext.S(16f)) / 2f;
+                GraphicsState state = g.Save();
+                g.TranslateTransform(left, top);
+                using (Pen pen = new Pen(color, TrayContext.S(1.4f)))
+                {
+                    pen.StartCap = LineCap.Round;
+                    pen.EndCap = LineCap.Round;
+                    pen.LineJoin = LineJoin.Round;
+                    if (kind == RowGlyph.Power)
+                    {
+                        g.DrawLine(pen, TrayContext.S(8f), TrayContext.S(2f), TrayContext.S(8f), TrayContext.S(6.4f));
+                        g.DrawArc(pen, TrayContext.S(3.4f), TrayContext.S(4.1f), TrayContext.S(9.2f), TrayContext.S(9.2f), 300f, 300f);
+                    }
+                    else if (kind == RowGlyph.Refresh)
+                    {
+                        g.DrawArc(pen, TrayContext.S(2.9f), TrayContext.S(2.9f), TrayContext.S(10.2f), TrayContext.S(10.2f), 330f, 300f);
+                        using (SolidBrush brush = new SolidBrush(color))
+                            g.FillPolygon(brush, new PointF[] {
+                                new PointF(TrayContext.S(7.9f), TrayContext.S(1.5f)),
+                                new PointF(TrayContext.S(7.9f), TrayContext.S(4.3f)),
+                                new PointF(TrayContext.S(11.1f), TrayContext.S(2.9f))
+                            });
+                    }
+                    else
+                    {
+                        using (GraphicsPath box = TrayContext.RoundedRect(new RectangleF(TrayContext.S(2.9f), TrayContext.S(2.9f), TrayContext.S(10.2f), TrayContext.S(10.2f)), TrayContext.S(2.2f)))
+                            g.DrawPath(pen, box);
+                        g.DrawLines(pen, new PointF[] {
+                            new PointF(TrayContext.S(5.3f), TrayContext.S(9.7f)),
+                            new PointF(TrayContext.S(7.1f), TrayContext.S(6.7f)),
+                            new PointF(TrayContext.S(9f), TrayContext.S(8.4f)),
+                            new PointF(TrayContext.S(11f), TrayContext.S(5.3f))
+                        });
+                    }
+                }
+                g.Restore(state);
+            }
+
+            private void AddActionRow(int x, ref int y, int width, string text, RowGlyph glyph, Action action)
+            {
+                PopupActionRow row = new PopupActionRow(text, glyph);
+                row.SetBounds(x, y, width, TrayContext.S(36));
+                row.Click += delegate { action(); };
+                Controls.Add(row);
+                y += TrayContext.S(36);
+            }
+
+            private void AddDivider(int x, int y, int width)
+            {
+                Panel divider = new Panel { BackColor = Line, Bounds = new Rectangle(x, y, width, Math.Max(1, TrayContext.S(1))) };
+                Controls.Add(divider);
+            }
+
+            private void ClearControls()
+            {
+                for (int i = Controls.Count - 1; i >= 0; i--)
+                {
+                    Control c = Controls[i];
+                    Controls.RemoveAt(i);
+                    c.Dispose();
+                }
+            }
+
+            private void ApplyPopupRegion()
+            {
+                Region old = Region;
+                using (GraphicsPath path = TrayContext.RoundedRect(new RectangleF(0, 0, Width, Height), TrayContext.S(13)))
+                    Region = new Region(path);
+                if (old != null) old.Dispose();
+                Invalidate();
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                base.OnPaint(e);
                 e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-                cardLeft = S(CardInset);
-                cardRight = e.ToolStrip.ClientSize.Width - S(CardInset);
-                Rectangle? list = null, settings = null;
-                bool afterExit = false;
-                foreach (ToolStripItem item in e.ToolStrip.Items)
+                using (Pen pen = new Pen(Color.FromArgb(220, 224, 232)))
+                using (GraphicsPath path = TrayContext.RoundedRect(new RectangleF(0.5f, 0.5f, Width - 1, Height - 1), TrayContext.S(13)))
+                    e.Graphics.DrawPath(pen, path);
+            }
+
+            private static Color Accent(int rank)
+            {
+                return rank == 0 ? Color.FromArgb(52, 199, 89) : rank == 2 ? Color.FromArgb(255, 59, 48) : Color.FromArgb(0, 122, 255);
+            }
+
+            private static Color Tint(int rank)
+            {
+                return rank == 0 ? Color.FromArgb(222, 247, 229) : rank == 2 ? Color.FromArgb(255, 226, 225) : Color.FromArgb(224, 237, 255);
+            }
+
+            private sealed class PopupHeader : Control
+            {
+                private readonly string subtitle;
+                private readonly int rank;
+                public PopupHeader(string subtitle, int rank)
                 {
-                    if (!item.Visible) continue;
-                    if (item is ToolStripMenuItem)
+                    this.subtitle = subtitle; this.rank = rank;
+                    SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.SupportsTransparentBackColor, true);
+                    Font = FontLabel; BackColor = Color.Transparent;
+                }
+                protected override void OnPaint(PaintEventArgs e)
+                {
+                    base.OnPaint(e); e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                    using (GraphicsPath p = TrayContext.RoundedRect(new RectangleF(0, 0, Width - 1, Height - 1), TrayContext.S(13)))
+                    using (SolidBrush b = new SolidBrush(Card)) e.Graphics.FillPath(b, p);
+                    int d = TrayContext.S(36), left = TrayContext.S(12), top = (Height - d) / 2;
+                    Rectangle circle = new Rectangle(left, top, d, d);
+                    using (SolidBrush b = new SolidBrush(Tint(rank))) e.Graphics.FillEllipse(b, circle);
+                    TextRenderer.DrawText(e.Graphics, "\uE945", FontHeaderGlyph, circle, Accent(rank), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                    int textX = left + d + TrayContext.S(10);
+                    TextRenderer.DrawText(e.Graphics, "PowerPlanTray", FontTitle, new Rectangle(textX, TrayContext.S(10), Width - textX - TrayContext.S(8), TrayContext.S(22)), TextMain, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+                    TextRenderer.DrawText(e.Graphics, subtitle, FontSub, new Rectangle(textX, TrayContext.S(32), Width - textX - TrayContext.S(8), TrayContext.S(18)), TextSub, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+                }
+            }
+
+            private sealed class PopupModeRow : Control
+            {
+                private readonly TrayContext owner;
+                private readonly PlanInfo plan;
+                private readonly int rank;
+                private readonly bool active;
+                private bool hovered;
+                public PopupModeRow(TrayContext owner, PlanInfo plan, int rank, bool active)
+                {
+                    this.owner = owner; this.plan = plan; this.rank = rank; this.active = active;
+                    SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.SupportsTransparentBackColor, true);
+                    BackColor = Color.Transparent; Cursor = Cursors.Hand; Font = FontLabel;
+                    AccessibleName = plan.Name;
+                }
+                protected override void OnPaint(PaintEventArgs e)
+                {
+                    base.OnPaint(e); e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                    RectangleF hit = new RectangleF(TrayContext.S(2), TrayContext.S(2), Width - TrayContext.S(4), Height - TrayContext.S(4));
+                    if (active || hovered)
                     {
-                        if (item.Text == "退出") { list = Union(list, item.Bounds); afterExit = true; }
-                        else if (afterExit) settings = Union(settings, item.Bounds);
-                        else list = Union(list, item.Bounds);
+                        Color fill = active ? Color.FromArgb(241, 247, 255) : Color.FromArgb(247, 248, 251);
+                        using (GraphicsPath p = TrayContext.RoundedRect(hit, TrayContext.S(9))) using (SolidBrush b = new SolidBrush(fill)) e.Graphics.FillPath(b, p);
+                        if (active) using (GraphicsPath p = TrayContext.RoundedRect(hit, TrayContext.S(9))) using (Pen pen = new Pen(Color.FromArgb(202, 222, 255), 1f)) e.Graphics.DrawPath(pen, p);
                     }
-                }
-                FillCard(e.Graphics, list);
-                FillCard(e.Graphics, settings);
-            }
-
-            private static Rectangle? Union(Rectangle? acc, Rectangle b)
-            {
-                return acc.HasValue ? Rectangle.Union(acc.Value, b) : b;
-            }
-
-            private void FillCard(Graphics g, Rectangle? bounds)
-            {
-                if (!bounds.HasValue) return;
-                Rectangle b = bounds.Value;
-                using (GraphicsPath path = RoundedRect(new RectangleF(cardLeft, b.Top - S(2f), cardRight - cardLeft, b.Height + S(4f)), S(10f)))
-                using (var brush = new SolidBrush(pal.Card))
-                    g.FillPath(brush, path);
-            }
-
-            protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e) { }
-
-            protected override void OnRenderImageMargin(ToolStripRenderEventArgs e) { }
-
-            protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e) { }
-
-            // 图像全部由渲染器画：基类会给 Checked 项在图像区画淡蓝色选中底版（与设计不符）
-            // 横向统一右移一个灰边距：窗口被撑宽后内容要落在卡片内
-            protected override void OnRenderItemImage(ToolStripItemImageRenderEventArgs e)
-            {
-                if (e.Image == null) return;
-                Rectangle r = e.ImageRectangle;
-                e.Graphics.DrawImage(e.Image,
-                    r.X + (r.Width - e.Image.Width) / 2 + S(CardInset),
-                    r.Y + (r.Height - e.Image.Height) / 2,
-                    e.Image.Width, e.Image.Height);
-            }
-
-            protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
-            {
-                if (textLeft == 0 && e.Item is ToolStripMenuItem) textLeft = e.TextRectangle.X;
-                // 雅黑行盒含 descent，CJK 字形视觉偏上，下移补偿到行格内 optical 居中。
-                // 实测（120DPI/9.5pt）：Regular 墨盒 15px 需 +4，Bold 墨盒 16px 且基线上移需 +5 才能上下留白相等。
-                Rectangle tr = e.TextRectangle;
-                tr.Offset(S(CardInset), S(e.Item.Font.Bold ? 5 : 4));
-                TextRenderer.DrawText(e.Graphics, e.Text, e.Item.Font, tr, e.Item.ForeColor,
-                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
-            }
-
-            protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
-            {
-                if (!e.Item.Enabled) return;
-
-                if (e.Item.Selected)
-                {
-                    // 悬停胶囊贴在卡片内 4px
-                    Rectangle rect = new Rectangle(cardLeft + S(4), S(1), cardRight - cardLeft - S(8), e.Item.Height - S(2));
-                    using (GraphicsPath path = RoundedRect(new RectangleF(rect.X, rect.Y, rect.Width, rect.Height), S(8f)))
-                    using (SolidBrush hover = new SolidBrush(pal.Hover))
+                    int d = TrayContext.S(34), x = TrayContext.S(8), y = (Height - d) / 2;
+                    Rectangle icon = new Rectangle(x, y, d, d);
+                    using (SolidBrush b = new SolidBrush(Tint(rank))) e.Graphics.FillEllipse(b, icon);
+                    DrawModeGlyph(e.Graphics, icon, rank);
+                    int tx = x + d + TrayContext.S(12);
+                    TextRenderer.DrawText(e.Graphics, plan.Name, FontLabel, new Rectangle(tx, 0, Width - tx - TrayContext.S(40), Height), TextMain, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+                    int markD = TrayContext.S(17), mx = Width - TrayContext.S(27), my = (Height - markD) / 2;
+                    Rectangle mark = new Rectangle(mx, my, markD, markD);
+                    if (active)
                     {
-                        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-                        e.Graphics.FillPath(hover, path);
+                        using (SolidBrush b = new SolidBrush(Accent(1))) e.Graphics.FillEllipse(b, mark);
+                        using (Pen pen = new Pen(Color.White, TrayContext.S(1.7f)))
+                        {
+                            e.Graphics.DrawLine(pen, mx + TrayContext.S(4), my + TrayContext.S(9), mx + TrayContext.S(7), my + TrayContext.S(12));
+                            e.Graphics.DrawLine(pen, mx + TrayContext.S(7), my + TrayContext.S(12), mx + TrayContext.S(13), my + TrayContext.S(5));
+                        }
                     }
+                    else using (Pen pen = new Pen(Color.FromArgb(181, 192, 208), TrayContext.S(1.2f))) e.Graphics.DrawEllipse(pen, mark);
                 }
-
-                // 选中对勾（Segoe MDL2 图标）画在卡片右侧内缩处：当前计划用强调蓝，开关状态用次级灰
-                ToolStripMenuItem menuItem = e.Item as ToolStripMenuItem;
-                if (menuItem != null && menuItem.Checked)
+                private void DrawModeGlyph(Graphics g, Rectangle r, int rank)
                 {
-                    Color checkColor = menuItem.Text == "开机自动启动" ? pal.MutedCheck : pal.AccentCheck;
-                    // 不加 y 偏移：MDL2 对勾墨盒本身居中即行格居中，与修正后的文字中线重合
-                    TextRenderer.DrawText(e.Graphics, "\uE73E", MenuCheckFont,
-                        new Rectangle(cardRight - S(26), 0, S(22), e.Item.Height),
-                        checkColor, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                    // 三档统一使用闪电图标，仅颜色随档位变化
+                    Color c = Accent(rank);
+                    Point[] bolt = new Point[] {
+                        new Point(r.X + TrayContext.S(19), r.Y + TrayContext.S(6)),
+                        new Point(r.X + TrayContext.S(11), r.Y + TrayContext.S(18)),
+                        new Point(r.X + TrayContext.S(17), r.Y + TrayContext.S(18)),
+                        new Point(r.X + TrayContext.S(14), r.Y + TrayContext.S(28)),
+                        new Point(r.X + TrayContext.S(24), r.Y + TrayContext.S(14)),
+                        new Point(r.X + TrayContext.S(18), r.Y + TrayContext.S(14))
+                    };
+                    using (SolidBrush b = new SolidBrush(c)) g.FillPolygon(b, bolt);
                 }
+                protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); hovered = true; Invalidate(); }
+                protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hovered = false; Invalidate(); }
             }
 
-            // 发丝线与文字左缘对齐：从相邻计划项的实际文字位置取，换字号/DPI 也不会错位
-            protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
+            private sealed class PopupActionRow : Control
             {
-                if (e.Item is CardGap) return; // 卡片之间的空隙不画线
-                int y = e.Item.Height / 2;
-                // 分隔线条目原点比计划条目靠右 2px，需换算回同一坐标系；汉字墨盒比文字框左缘再靠右 5px
-                int origin = e.Item.Bounds.X;
-                int left = (textLeft > 0 ? textLeft + S(5) : S(36)) + S(CardInset) - origin;
-                int right = (cardRight > 0 ? cardRight : e.Item.Width - S(CardInset)) - origin - S(12);
-                using (Pen pen = new Pen(pal.Separator))
-                    e.Graphics.DrawLine(pen, left, y, right, y);
+                private readonly RowGlyph glyph;
+                private bool hovered;
+                public PopupActionRow(string text, RowGlyph glyph)
+                {
+                    Text = text; this.glyph = glyph; Font = FontLabel;
+                    SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.SupportsTransparentBackColor, true);
+                    BackColor = Color.Transparent; Cursor = Cursors.Hand;
+                }
+                protected override void OnPaint(PaintEventArgs e)
+                {
+                    base.OnPaint(e); e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                    if (hovered)
+                    {
+                        using (GraphicsPath p = TrayContext.RoundedRect(new RectangleF(TrayContext.S(2), TrayContext.S(1), Width - TrayContext.S(4), Height - TrayContext.S(2)), TrayContext.S(8)))
+                        using (SolidBrush b = new SolidBrush(Color.FromArgb(230, 234, 241))) e.Graphics.FillPath(b, p);
+                    }
+                    DrawRowGlyph(e.Graphics, new Rectangle(TrayContext.S(12), 0, TrayContext.S(22), Height), glyph, Color.FromArgb(63, 79, 101));
+                    TextRenderer.DrawText(e.Graphics, Text, FontLabel, new Rectangle(TrayContext.S(43), 0, Width - TrayContext.S(68), Height), TextMain, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+                    TextRenderer.DrawText(e.Graphics, "\uE76C", FontGlyph, new Rectangle(Width - TrayContext.S(28), 0, TrayContext.S(16), Height), TextSub, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                }
+                protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); hovered = true; Invalidate(); }
+                protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hovered = false; Invalidate(); }
+            }
+
+            private sealed class AutoStartRow : Control
+            {
+                private readonly bool enabled;
+                private bool hovered;
+
+                public AutoStartRow(bool enabled)
+                {
+                    this.enabled = enabled;
+                    SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.SupportsTransparentBackColor, true);
+                    BackColor = Color.Transparent; Cursor = Cursors.Hand; Font = FontLabel;
+                    AccessibleName = "开机自动启动";
+                }
+
+                protected override void OnPaint(PaintEventArgs e)
+                {
+                    base.OnPaint(e); e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                    if (hovered)
+                    {
+                        using (GraphicsPath p = TrayContext.RoundedRect(new RectangleF(TrayContext.S(2), TrayContext.S(1), Width - TrayContext.S(4), Height - TrayContext.S(2)), TrayContext.S(8)))
+                        using (SolidBrush b = new SolidBrush(Color.FromArgb(230, 234, 241))) e.Graphics.FillPath(b, p);
+                    }
+                    DrawRowGlyph(e.Graphics, new Rectangle(TrayContext.S(12), 0, TrayContext.S(22), Height), RowGlyph.Power, Color.FromArgb(63, 79, 101));
+                    TextRenderer.DrawText(e.Graphics, "开机自动启动", FontLabel, new Rectangle(TrayContext.S(43), 0, Width - TrayContext.S(110), Height), TextMain, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+
+                    Rectangle track = new Rectangle(Width - TrayContext.S(56), (Height - TrayContext.S(24)) / 2, TrayContext.S(42), TrayContext.S(24));
+                    using (GraphicsPath p = TrayContext.RoundedRect(track, TrayContext.S(12)))
+                    using (SolidBrush b = new SolidBrush(enabled ? Color.FromArgb(48, 209, 88) : Color.FromArgb(205, 210, 218))) e.Graphics.FillPath(b, p);
+                    int d = TrayContext.S(18), cx = enabled ? track.Right - d - TrayContext.S(3) : track.X + TrayContext.S(3);
+                    using (SolidBrush b = new SolidBrush(Color.White)) e.Graphics.FillEllipse(b, cx, track.Y + TrayContext.S(3), d, d);
+                }
+
+                protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); hovered = true; Invalidate(); }
+                protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hovered = false; Invalidate(); }
             }
         }
-
-        // 卡片间隙（不可见）与行间缩进发丝线
-        private sealed class CardGap : ToolStripSeparator { }
-        private sealed class InsetSeparator : ToolStripSeparator { }
 
         // 只收消息、永不显示的窗体
         private sealed class OwnerForm : Form

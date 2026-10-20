@@ -2,6 +2,11 @@
 *.exe
 *.pdb
 
+# 发布包与临时打包目录
+*.zip
+dist/
+_stage_*/
+
 # Visual Studio / IDE
 .vs/
 bin/
